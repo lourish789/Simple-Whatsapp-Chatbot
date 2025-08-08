@@ -1,0 +1,237 @@
+import os
+import time
+import re
+import concurrent.futures
+from pinecone import Pinecone, ServerlessSpec
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from tqdm import tqdm
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Document Processing Functions
+def split_docs(documents, chunk_size=1500, chunk_overlap=150):
+    """
+    Split documents into manageable chunks with optimal overlap
+    for cancer-related medical content
+    """
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size, 
+        chunk_overlap=chunk_overlap,
+        separators=["\n\n", "\n", ". ", " ", ""]
+    )
+    return text_splitter.split_documents(documents)
+
+def parse_retry_wait_time(error):
+    """Extract retry wait time from API error messages"""
+    error_str = str(error).lower()
+    
+    # Look for various wait time patterns
+    patterns = [
+        r'wait (\d+) seconds',
+        r'try again in (\d+) seconds',
+        r'retry after (\d+)',
+        r'rate limit.*?(\d+).*?second'
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, error_str)
+        if match:
+            return int(match.group(1))
+    return 60  # Default wait time
+
+def embed_batch_with_retry(embed_model, batch_contents, max_attempts=3):
+    """
+    Generate embeddings with intelligent retry logic for API stability
+    """
+    for attempt in range(max_attempts):
+        try:
+            embeddings = embed_model.embed_documents(batch_contents)
+            return embeddings
+        except Exception as e:
+            if attempt < max_attempts - 1:
+                wait_time = parse_retry_wait_time(e)
+                print(f"Embedding attempt {attempt + 1} failed. Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+            else:
+                print(f"All embedding attempts failed for batch. Error: {e}")
+                return None
+
+def concurrent_embed_documents(embed_model, documents, batch_size=50, max_workers=3):
+    """
+    Process document embeddings concurrently for better performance
+    """
+    all_embeddings = []
+    all_batch_content = []
+    
+    # Prepare batches
+    batches = []
+    for i in range(0, len(documents), batch_size):
+        batch_docs = documents[i:i + batch_size]
+        batch_contents = [doc.page_content for doc in batch_docs]
+        batches.append(batch_contents)
+    
+    # Process batches concurrently
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_batch = {
+            executor.submit(embed_batch_with_retry, embed_model, batch): batch 
+            for batch in batches
+        }
+        
+        for future in tqdm(concurrent.futures.as_completed(future_to_batch), 
+                          total=len(batches), desc="Creating embeddings"):
+            batch_contents = future_to_batch[future]
+            try:
+                embeddings = future.result()
+                if embeddings:
+                    all_embeddings.extend(embeddings)
+                    all_batch_content.extend(batch_contents)
+            except Exception as e:
+                print(f"Failed to process batch: {e}")
+    
+    return all_embeddings, all_batch_content
+
+# Initialize APIs
+def initialize_services():
+    """Initialize Pinecone and Google Gemini services"""
+    
+    # API Keys (use environment variables in production)
+    PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+    GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+    
+    if not PINECONE_API_KEY or not GOOGLE_API_KEY:
+        raise ValueError("Missing required API keys. Please check your environment variables.")
+    
+    # Initialize embedding model
+    embed_model = GoogleGenerativeAIEmbeddings(
+        model="models/embedding-001", 
+        google_api_key=GOOGLE_API_KEY
+    )
+    
+    # Initialize Pinecone
+    pc = Pinecone(api_key=PINECONE_API_KEY)
+    
+    return embed_model, pc
+
+def setup_pinecone_index(pc, index_name='cancer-coach'):
+    """Create or connect to Pinecone index"""
+    
+    existing_indexes = pc.list_indexes()
+    existing_index_names = [index.name for index in existing_indexes.indexes]
+    
+    if index_name not in existing_index_names:
+        print(f"Creating new Pinecone index: {index_name}")
+        pc.create_index(
+            name=index_name,
+            dimension=768,  # Gemini embedding dimension
+            metric='cosine',
+            spec=ServerlessSpec(cloud='aws', region='us-east-1')
+        )
+        # Wait for index to be ready
+        time.sleep(60)
+    
+    return pc.Index(index_name)
+
+def load_cancer_documents(pdf_directory_path):
+    """Load and process cancer-related PDF documents"""
+    
+    documents = []
+    pdf_files = [f for f in os.listdir(pdf_directory_path) if f.endswith('.pdf')]
+    
+    print(f"Loading {len(pdf_files)} PDF documents...")
+    
+    for filename in tqdm(pdf_files, desc="Loading PDFs"):
+        file_path = os.path.join(pdf_directory_path, filename)
+        try:
+            loader = PyPDFLoader(file_path)
+            docs = loader.load()
+            documents.extend(docs)
+            print(f"✅ Loaded {filename}: {len(docs)} pages")
+        except Exception as e:
+            print(f"❌ Failed to load {filename}: {e}")
+    
+    return documents
+
+def batch_upsert_to_pinecone(index, vectors, batch_size=100):
+    """Upload vectors to Pinecone in batches with error handling"""
+    
+    total_batches = len(vectors) // batch_size + (1 if len(vectors) % batch_size else 0)
+    
+    for i in tqdm(range(0, len(vectors), batch_size), desc="Uploading to Pinecone"):
+        batch = vectors[i:i + batch_size]
+        
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                index.upsert(vectors=batch)
+                break
+            except Exception as e:
+                if attempt < max_attempts - 1:
+                    wait_time = parse_retry_wait_time(e)
+                    print(f"Upload batch {i//batch_size + 1} failed. Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    print(f"Failed to upload batch {i//batch_size + 1}: {e}")
+
+# Main execution function
+def build_knowledge_base(pdf_directory_path):
+    """Main function to build the cancer knowledge base"""
+    
+    print("🚀 Starting Cancer Knowledge Base Creation...")
+    
+    # Initialize services
+    embed_model, pc = initialize_services()
+    pinecone_index = setup_pinecone_index(pc)
+    
+    # Load documents
+    documents = load_cancer_documents(pdf_directory_path)
+    
+    if not documents:
+        print("❌ No documents loaded. Please check your PDF directory.")
+        return
+    
+    # Split documents into chunks
+    print("📄 Splitting documents into chunks...")
+    docs = split_docs(documents, chunk_size=1500, chunk_overlap=150)
+    print(f"Created {len(docs)} document chunks")
+    
+    # Create embeddings
+    print("🧠 Creating embeddings...")
+    all_embeddings, all_batch_content = concurrent_embed_documents(
+        embed_model, docs, batch_size=50, max_workers=3
+    )
+    
+    if not all_embeddings:
+        print("❌ Failed to create embeddings.")
+        return
+    
+    # Prepare vectors for Pinecone
+    print("📤 Preparing vectors for upload...")
+    vectors_to_upsert = [
+        (
+            f"doc_{idx}", 
+            embedding, 
+            {
+                "text": content,
+                "chunk_id": idx,
+                "document_type": "cancer_medical_content"
+            }
+        )
+        for idx, (embedding, content) in enumerate(zip(all_embeddings, all_batch_content))
+    ]
+    
+    # Upload to Pinecone
+    print("☁️ Uploading to Pinecone...")
+    batch_upsert_to_pinecone(pinecone_index, vectors_to_upsert)
+    
+    print("✅ Cancer Knowledge Base created successfully!")
+    print(f"📊 Total vectors stored: {len(vectors_to_upsert)}")
+
+# Run the knowledge base creation
+if __name__ == "__main__":
+    # Specify your PDF directory path
+    PDF_DIRECTORY = "./cancer_documents"  # Update this path
+    build_knowledge_base(PDF_DIRECTORY)
