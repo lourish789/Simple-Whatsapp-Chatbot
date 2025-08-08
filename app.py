@@ -1,6 +1,5 @@
 #main.py
 
-
 import os
 import asyncio
 import nest_asyncio
@@ -12,249 +11,330 @@ from langchain.chains import LLMChain
 from langchain.memory import ChatMessageHistory, ConversationBufferMemory
 from pinecone import Pinecone
 from whatsapp_chatbot_python import GreenAPIBot, Notification
+from dotenv import load_dotenv
 
-# Apply nest_asyncio patch
+# Load environment variables
+load_dotenv()
 nest_asyncio.apply()
 
-# Get API keys
-PINECONE_API_KEY = "pcsk_zRyjS_2FyS6uk3NsKW9AHPzDvvQPzANF2S3B67MS6UZ7ax6tnJfmCbLiYXrEcBJFHzcHg"
-GOOGLE_API_KEY = "AIzaSyB3N9BHeIWs_8sdFK76PU-v9N6prcIq2Hw"
-
-# Check for missing API keys
-if not PINECONE_API_KEY:
-    raise ValueError("Pinecone API key is missing.")
-if not GOOGLE_API_KEY:
-    raise ValueError("Google API key is missing.")
-
-# Initialize Pinecone and embedding model
-pc = Pinecone(api_key=PINECONE_API_KEY)
-pinecone_index = pc.Index("coach")
-embed_model = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=GOOGLE_API_KEY)
-
-# Initialize Google Generative AI
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
-    google_api_key=GOOGLE_API_KEY,
-    temperature=0.7,
-    max_tokens=1000
-)
-
-# Define system prompt template
-system_prompt_template = """
-Your name is Nigerian Teaching Coach Chatbot. You are a professional teaching expert for Nigerian schools effective in class management, student handling, stress handling and teaching responsibilities. Answer questions very very briefly and accurately. Use the following information to answer the user's question:
-
-{doc_content}
-
-Provide very brief accurate and helpful health response based on the provided information and your expertise. But explain concisely if need be
-"""
-
-class TeacherAI:
-    def __init__(self, llm, system_prompt_template):
+class CancerCoachAI:
+    """
+    Intelligent Cancer Coach AI that provides personalized support
+    using RAG technology and conversation memory
+    """
+    
+    def __init__(self, llm, embed_model, pinecone_index):
         self.llm = llm
-        self.system_prompt_template = system_prompt_template
+        self.embed_model = embed_model
+        self.pinecone_index = pinecone_index
+        
+        # Enhanced system prompt for cancer coaching
+        self.system_prompt_template = """
+        You are CancerCare Coach, a compassionate and knowledgeable AI assistant specifically designed to support cancer patients and their families. 
 
-        # Create prompt template
+        Your core principles:
+        1. **Empathy First**: Always acknowledge the emotional weight of cancer journey
+        2. **Evidence-Based**: Use provided medical information while encouraging professional consultation
+        3. **Personalized Support**: Tailor responses to individual patient circumstances
+        4. **Hope & Encouragement**: Maintain a balance of realism and optimism
+        5. **Clear Communication**: Explain complex medical concepts in understandable terms
+
+        Important Guidelines:
+        - NEVER provide specific medical diagnoses or treatment recommendations
+        - Always encourage patients to consult healthcare professionals for medical decisions
+        - Focus on emotional support, general information, and practical guidance
+        - Be sensitive to the patient's stage of treatment and emotional state
+        - Acknowledge uncertainty when information is not available
+
+        Patient Context: {patient_name} - {cancer_type} - {treatment_stage}
+
+        Relevant Medical Information:
+        {doc_content}
+
+        Respond with compassion, accuracy, and practical support while maintaining appropriate medical boundaries.
+        """
+
+        # Create conversation prompt template
         self.prompt = ChatPromptTemplate.from_messages([
-            SystemMessagePromptTemplate.from_template(system_prompt_template),
+            SystemMessagePromptTemplate.from_template(self.system_prompt_template),
             MessagesPlaceholder(variable_name="chat_history"),
             HumanMessagePromptTemplate.from_template("{input}")
         ])
 
-        # Create chain
+        # Create conversation chain
         self.chain = LLMChain(
             llm=self.llm,
             prompt=self.prompt,
             verbose=False
         )
 
-    def generate_coaching_response(self, user_input, conversation_history):
+    def extract_patient_info(self, message):
+        """Extract patient information from initial messages"""
+        message_lower = message.lower()
+        
+        # Common cancer types
+        cancer_types = [
+            'breast cancer', 'lung cancer', 'colorectal cancer', 'prostate cancer',
+            'skin cancer', 'melanoma', 'leukemia', 'lymphoma', 'brain cancer',
+            'pancreatic cancer', 'liver cancer', 'kidney cancer', 'bladder cancer'
+        ]
+        
+        # Treatment stages
+        treatment_stages = [
+            'newly diagnosed', 'in treatment', 'chemotherapy', 'radiation',
+            'surgery', 'remission', 'survivor', 'palliative care', 'post-treatment'
+        ]
+        
+        detected_cancer = None
+        detected_stage = None
+        
+        for cancer in cancer_types:
+            if cancer in message_lower:
+                detected_cancer = cancer
+                break
+        
+        for stage in treatment_stages:
+            if stage in message_lower:
+                detected_stage = stage
+                break
+                
+        return detected_cancer, detected_stage
+
+    def retrieve_relevant_documents(self, user_input, top_k=5):
+        """Retrieve most relevant documents from Pinecone"""
         try:
-            # Convert conversation history to langchain format
+            # Create embedding for user query
+            query_embed = self.embed_model.embed_query(user_input)
+            query_embed = [float(val) for val in query_embed]
+            
+            # Query Pinecone
+            results = self.pinecone_index.query(
+                vector=query_embed,
+                top_k=top_k,
+                include_values=False,
+                include_metadata=True
+            )
+            
+            # Extract document contents
+            doc_contents = []
+            for match in results.get('matches', []):
+                text = match['metadata'].get('text', '')
+                relevance_score = match.get('score', 0)
+                if text and relevance_score > 0.7:  # Only include highly relevant content
+                    doc_contents.append(text)
+            
+            return "\n\n".join(doc_contents) if doc_contents else "No specific medical information found."
+            
+        except Exception as e:
+            print(f"Error retrieving documents: {e}")
+            return "Unable to retrieve relevant medical information at this time."
+
+    def generate_coach_response(self, user_input, patient_context, conversation_history):
+        """Generate personalized coaching response using RAG"""
+        try:
+            # Retrieve relevant medical documents
+            doc_content = self.retrieve_relevant_documents(user_input)
+            
+            # Convert conversation history to LangChain format
             chat_history = []
-            for entry in conversation_history[-10:]:  # Use last 10 entries
+            for entry in conversation_history[-8:]:  # Last 8 messages for context
                 if entry["role"] == "user":
                     chat_history.append(("human", entry["message"]))
                 elif entry["role"] == "assistant":
                     chat_history.append(("ai", entry["message"]))
 
-            # Generate response
+            # Generate response using the chain
             response = self.chain.run(
                 input=user_input,
                 chat_history=chat_history,
-                doc_content=""  # Will be filled from Pinecone results
+                doc_content=doc_content,
+                patient_name=patient_context.get('name', 'friend'),
+                cancer_type=patient_context.get('cancer_type', 'your condition'),
+                treatment_stage=patient_context.get('treatment_stage', 'your journey')
             )
 
             return response.strip()
 
         except Exception as e:
             print(f"Error generating response: {e}")
-            return "I'm having trouble processing your request right now. Please try again."
+            return "I'm having some technical difficulties right now, but I'm here for you. Could you please try asking your question again?"
 
-# Initialize the teacher AI
-teacher_ai = TeacherAI(llm, system_prompt_template)
+def initialize_ai_services():
+    """Initialize all AI services and return configured instances"""
+    
+    # Get API keys
+    PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+    GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+    
+    if not PINECONE_API_KEY or not GOOGLE_API_KEY:
+        raise ValueError("Missing required API keys. Please check your environment variables.")
+    
+    # Initialize Pinecone
+    pc = Pinecone(api_key=PINECONE_API_KEY)
+    pinecone_index = pc.Index("cancer-coach")  # Use the index we created
+    
+    # Initialize embedding model
+    embed_model = GoogleGenerativeAIEmbeddings(
+        model="models/embedding-001", 
+        google_api_key=GOOGLE_API_KEY
+    )
+    
+    # Initialize language model
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-1.5-flash",  # Updated model name
+        google_api_key=GOOGLE_API_KEY,
+        temperature=0.7,  # Balance between creativity and consistency
+        max_tokens=1000
+    )
+    
+    # Create cancer coach AI
+    cancer_coach = CancerCoachAI(llm, embed_model, pinecone_index)
+    
+    return cancer_coach
+
+# Initialize the AI coach
+print("🤖 Initializing Cancer Coach AI...")
+cancer_coach = initialize_ai_services()
+print("✅ AI Coach ready!")
 
 # Initialize WhatsApp bot
+GREEN_API_ID = os.getenv("GREEN_API_ID", "your_green_api_id")
+GREEN_API_TOKEN = os.getenv("GREEN_API_TOKEN", "your_green_api_token")
+
 bot = GreenAPIBot(
-    "7105287498", "0017430b3b204cf28ac14a41cc5ede0ce8e5a68d91134d5fbe",
-    debug_mode=True, bot_debug_mode=True
+    GREEN_API_ID, 
+    GREEN_API_TOKEN,
+    debug_mode=True,
+    bot_debug_mode=True
 )
 
-# Store conversation history and teacher info for each user
-conversation_histories = {}  # chat_id: {"history": [...], "name": "Teacher", "class": "Primary 3"}
-
-def extract_name_and_class(message):
-    """Extract teacher name and class from message"""
-    message_lower = message.lower()
-
-    # Pattern for "my name is X and I teach Y"
-    pattern1 = r"my name is\s+([^,\n]+?)\s+and\s+i teach\s+([^,\n]+)"
-    match1 = re.search(pattern1, message_lower)
-    if match1:
-        return match1.group(1).strip(), match1.group(2).strip()
-
-    # Pattern for "I am X, I teach Y"
-    pattern2 = r"i am\s+([^,\n]+?)[,\s]+i teach\s+([^,\n]+)"
-    match2 = re.search(pattern2, message_lower)
-    if match2:
-        return match2.group(1).strip(), match2.group(2).strip()
-
-    # Pattern for "X teaching Y" or "X teaches Y"
-    pattern3 = r"([a-zA-Z\s]+?)\s+teach(?:ing|es)?\s+([a-zA-Z0-9\s]+)"
-    match3 = re.search(pattern3, message_lower)
-    if match3 and len(match3.group(1).strip().split()) <= 3:
-        return match3.group(1).strip(), match3.group(2).strip()
-
-    return None, None
+# Store patient profiles and conversation history
+patient_profiles = {}  # chat_id: {"name": str, "cancer_type": str, "treatment_stage": str, "history": [...]}
 
 @bot.router.message(command="start")
-def message_handler(notification: Notification) -> None:
+def welcome_handler(notification: Notification) -> None:
+    """Handle new patients and welcome messages"""
     chat_id = notification.chat
 
-    # Initialize conversation structure
-    conversation_histories[chat_id] = {
-        "history": [],
+    # Initialize patient profile
+    patient_profiles[chat_id] = {
         "name": None,
-        "class": None
+        "cancer_type": None,
+        "treatment_stage": None,
+        "history": [],
+        "last_interaction": datetime.now().isoformat()
     }
 
     welcome_message = (
-        "👋 Hello! I'm **Coach bot**, your friendly AI teaching coach assistant.\n\n"
-        "An initiative of Schoolinka, For more information, https://www.schoolinka.com/ \n"
-        "Before we begin, could you please tell me your **name** and the **class you teach**? "
-        "For example: `My name is Sarah and I teach Primary 3.`\n\n"
-        "Once I know that, I can provide more personalized support for your classroom journey! 🏫💡"
+        "🌟 **Welcome to CancerCare Coach** 🌟\n\n"
+        "I'm here to provide support, information, and encouragement throughout your cancer journey. "
+        "While I can't replace your medical team, I can offer:\n\n"
+        "• 📚 Information about cancer and treatments\n"
+        "• 💪 Emotional support and encouragement\n"
+        "• 🏥 Guidance on questions to ask your healthcare team\n"
+        "• 🤝 Connection to support resources\n\n"
+        "To get started, could you share:\n"
+        "• Your name (how you'd like me to address you)\n"
+        "• Your cancer type (if you're comfortable sharing)\n"
+        "• Where you are in your treatment journey\n\n"
+        "For example: *\"Hi, I'm Sarah. I was recently diagnosed with breast cancer and starting chemotherapy next week.\"*\n\n"
+        "Remember: I encourage you to always consult with your healthcare team for medical decisions. 💙"
     )
+    
     notification.answer(welcome_message)
 
 @bot.router.message()
-def ai_coaching_handler(notification: Notification) -> None:
+def coach_message_handler(notification: Notification) -> None:
+    """Main message handler for cancer coaching conversations"""
     try:
+        # Extract message content
         message_data = notification.event.get("messageData", {})
         text_data = message_data.get("textMessageData", {})
-        user_message = text_data.get("textMessage", "")
+        user_message = text_data.get("textMessage", "").strip()
         chat_id = notification.chat
 
-        if not user_message.strip():
-            notification.answer("I didn't catch that. Could you say that again? 🤔")
+        if not user_message:
+            notification.answer("I didn't receive your message clearly. Could you please send it again? 🤗")
             return
 
-        # Initialize history if new user
-        if chat_id not in conversation_histories:
-            conversation_histories[chat_id] = {"history": [], "name": None, "class": None}
+        # Initialize profile if new user
+        if chat_id not in patient_profiles:
+            patient_profiles[chat_id] = {
+                "name": None,
+                "cancer_type": None,
+                "treatment_stage": None,
+                "history": [],
+                "last_interaction": datetime.now().isoformat()
+            }
 
-        teacher_info = conversation_histories[chat_id]
+        patient = patient_profiles[chat_id]
 
-        # If teacher name and class not provided, extract them
-        if teacher_info["name"] is None or teacher_info["class"] is None:
-            name, class_taught = extract_name_and_class(user_message)
+        # Extract patient info from message if not already set
+        if not patient["name"] or not patient["cancer_type"]:
+            cancer_type, treatment_stage = cancer_coach.extract_patient_info(user_message)
+            
+            # Simple name extraction
+            name_patterns = [
+                r"i[''']?m ([a-zA-Z]+)",
+                r"my name is ([a-zA-Z]+)",
+                r"call me ([a-zA-Z]+)",
+                r"i am ([a-zA-Z]+)"
+            ]
+            
+            detected_name = None
+            for pattern in name_patterns:
+                match = re.search(pattern, user_message.lower())
+                if match:
+                    detected_name = match.group(1).capitalize()
+                    break
+            
+            # Update patient profile
+            if detected_name and not patient["name"]:
+                patient["name"] = detected_name
+            if cancer_type and not patient["cancer_type"]:
+                patient["cancer_type"] = cancer_type
+            if treatment_stage and not patient["treatment_stage"]:
+                patient["treatment_stage"] = treatment_stage
 
-            if name and class_taught:
-                teacher_info["name"] = name.title()
-                teacher_info["class"] = class_taught.title()
-
-                notification.answer(
-                    f"Thank you, {teacher_info['name']}! I've saved that you teach {teacher_info['class']}.\n"
-                    "How can I support you today with your class or teaching journey?"
-                )
-                return
-            else:
-                notification.answer("Please tell me your name and class like this: `My name is James and I teach JSS 1` 😊")
-                return
-
-        # Add user message to conversation history
-        teacher_info["history"].append({
+        # Add user message to history
+        patient["history"].append({
             "role": "user",
             "message": user_message,
             "timestamp": datetime.now().isoformat()
         })
 
         # Trim history to last 20 messages
-        if len(teacher_info["history"]) > 20:
-            teacher_info["history"] = teacher_info["history"][-20:]
-
-        # Embed the user's question
-        query_embed = embed_model.embed_query(user_message)
-        query_embed = [float(val) for val in query_embed]
-
-        # Query Pinecone for relevant documents
-        results = pinecone_index.query(
-            vector=query_embed,
-            top_k=5,
-            include_values=False,
-            include_metadata=True
-        )
-
-        # Extract document contents
-        doc_contents = []
-        for match in results.get('matches', []):
-            text = match['metadata'].get('text', '')
-            if text:
-                doc_contents.append(text)
-
-        doc_content = "\n".join(doc_contents) if doc_contents else "No additional information found."
-
-        # Create enhanced prompt with context
-        enhanced_prompt = f"""
-        You are Coach bot, a supportive and highly experienced AI teaching coach for Nigerian teachers, an initiative of Schoolinka.
-        Your goal is to provide practical, empathetic, and contextually relevant advice for Nigerian classrooms, considering challenges like large class sizes, limited resources, and power outages.
-        Reference the provided information where appropriate, but also use your general teaching expertise.
-        Keep your responses concise and actionable, providing clear examples relevant to the Nigerian educational setting.
-        Always maintain a positive and encouraging tone.
-
-        Teacher Information:
-        - Name: {teacher_info['name']}
-        - Class: {teacher_info['class']}
-
-        Relevant Information:
-        {doc_content}
-
-        Teacher's Question: {user_message}
-        """
+        if len(patient["history"]) > 20:
+            patient["history"] = patient["history"][-20:]
 
         # Generate AI response
-        ai_response = teacher_ai.generate_coaching_response(enhanced_prompt, teacher_info["history"])
-
-        # Personalize response with teacher name
-        if teacher_info["name"] and not ai_response.startswith(teacher_info["name"]):
-            ai_response = f"{teacher_info['name']}, {ai_response}"
+        ai_response = cancer_coach.generate_coach_response(
+            user_message, 
+            patient, 
+            patient["history"]
+        )
 
         # Add AI response to history
-        teacher_info["history"].append({
+        patient["history"].append({
             "role": "assistant",
             "message": ai_response,
             "timestamp": datetime.now().isoformat()
         })
 
-        # Trim history again after adding assistant's response
-        if len(teacher_info["history"]) > 20:
-            teacher_info["history"] = teacher_info["history"][-20:]
+        # Update last interaction
+        patient["last_interaction"] = datetime.now().isoformat()
 
+        # Send response
         notification.answer(ai_response)
 
     except Exception as e:
-        print(f"Error in AI handler: {e}")
-        notification.answer("Oops, something went wrong. Please try again shortly. 💡")
+        print(f"Error in coach handler: {e}")
+        notification.answer(
+            "I apologize, but I'm experiencing some technical difficulties. "
+            "Please try sending your message again, and I'll do my best to help you. 💙"
+        )
 
 if __name__ == "__main__":
-    print("Starting WhatsApp Teaching Coach Bot...")
+    print("🚀 Starting CancerCare Coach WhatsApp Bot...")
+    print("📱 Ready to support cancer patients via WhatsApp")
     bot.run_forever()
