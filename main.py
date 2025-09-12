@@ -36,13 +36,18 @@ logger = logging.getLogger(__name__)
 # Configuration
 class Config:
     # API Keys - Set these as environment variables
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-    PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-    GREEN_API_INSTANCE_ID = os.getenv("GREEN_API_INSTANCE_ID")
-    GREEN_API_ACCESS_TOKEN = os.getenv("GREEN_API_ACCESS_TOKEN")
+    PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "pcsk_zRyjS_2FyS6uk3NsKW9AHPzDvvQPzANF2S3B67MS6UZ7ax6tnJfmCbLiYXrEcBJFHzcHg")
+    GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "AIzaSyB3N9BHeIWs_8sdFK76PU-v9N6prcIq2Hw")
+    GREEN_API_ID_INSTANCE = os.getenv("GREEN_API_ID_INSTANCE", "7105287498")
+    GREEN_API_TOKEN = os.getenv("GREEN_API_TOKEN", "0017430b3b204cf28ac14a41cc5ede0ce8e5a68d91134d5fbe")
+
+    #OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+    #PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+    #GREEN_API_INSTANCE_ID = os.getenv("GREEN_API_INSTANCE_ID")
+    #GREEN_API_ACCESS_TOKEN = os.getenv("GREEN_API_ACCESS_TOKEN")
     
     # Pinecone settings
-    PINECONE_INDEX_NAME = "cancer-support-db"
+    PINECONE_INDEX_NAME = "cancel"
     PINECONE_DIMENSION = 1536  # OpenAI embedding dimension
     
     # OpenAI settings
@@ -364,7 +369,7 @@ Always maintain a warm, supportive tone while being informative and helpful."""
             
             # Generate response using OpenAI
             response = openai.chat.completions.create(
-                model=Config.OPENAI_MODEL,
+                model=Config.GOOGLE_API_KEY,
                 messages=messages,
                 max_tokens=800,
                 temperature=0.7
@@ -393,7 +398,7 @@ class CancerSupportChatbot:
         self.ai_generator = AIResponseGenerator(self.vector_db, self.db_manager)
         
         # Initialize OpenAI
-        openai.api_key = Config.OPENAI_API_KEY
+        openai.api_key = Config.GOOGLE_API_KEY
         
         logger.info("Cancer Support Chatbot initialized successfully")
     
